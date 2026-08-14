@@ -238,6 +238,124 @@
       (should (equal (org-entry-get nil "CODEX_THREAD_ID") "global-choice"))
       (should (equal (org-entry-get nil "CODEX_CWD") "/tmp/global")))))
 
+(ert-deftest codex-ide-org-status-annotation-separates-workflow-from-runtime ()
+  (codex-ide-org-test-with-file
+      "* REVIEW Review linked\n:PROPERTIES:\n:CODEX_THREAD_ID: linked-row\n:END:\n* TODO First duplicate\n:PROPERTIES:\n:CODEX_THREAD_ID: duplicate-row\n:END:\n* HOLD Second duplicate\n:PROPERTIES:\n:CODEX_THREAD_ID: duplicate-row\n:END:\n"
+    (should (equal (codex-ide-org-status-annotation
+                    '(:thread-id "linked-row" :technical-status "running"))
+                   "Workflow: REVIEW"))
+    (should (equal (codex-ide-org-status-annotation
+                    '(:thread-id "linked-row" :technical-status "stored"))
+                   "Workflow: REVIEW"))
+    (should (equal (codex-ide-org-status-annotation
+                    '(:thread-id "missing-row" :technical-status "running"))
+                   "Workflow: UNLINKED"))
+    (should (equal (codex-ide-org-status-annotation
+                    '(:thread-id "duplicate-row" :technical-status "idle"))
+                   "Workflow: DUPLICATE"))))
+
+(ert-deftest codex-ide-org-status-integration-registers-context-actions ()
+  (let ((codex-ide-status-annotation-functions nil)
+        (codex-ide-status-actions nil)
+        (codex-ide-org-index-updated-hook nil)
+        (codex-ide-org-status-integration-enabled-p nil))
+    (cl-letf (((symbol-function 'codex-ide-status-notify-annotations-changed)
+               #'ignore)
+              ((symbol-function 'codex-ide-org--row-link-state)
+               (lambda (row)
+                 (list :status (plist-get row :org-status)))))
+      (should (codex-ide-org-register-status-integration))
+      (should (memq #'codex-ide-org-status-annotation
+                    codex-ide-status-annotation-functions))
+      (should (memq #'codex-ide-org--status-index-updated
+                    codex-ide-org-index-updated-hook))
+      (should (codex-ide-org-register-status-integration))
+      (should (= (length codex-ide-status-annotation-functions) 1))
+      (should (= (length codex-ide-status-actions) 3))
+      (should (equal
+               (mapcar (lambda (action) (plist-get action :name))
+                       (codex-ide-status-available-actions
+                        '(:thread-id "missing" :org-status missing)))
+               '("Org: Create task")))
+      (should (equal
+               (mapcar (lambda (action) (plist-get action :name))
+                       (codex-ide-status-available-actions
+                        '(:thread-id "linked" :org-status linked)))
+               '("Org: Go to task" "Org: Set workflow state")))
+      (should (equal
+               (mapcar (lambda (action) (plist-get action :name))
+                       (codex-ide-status-available-actions
+                        '(:thread-id "duplicate" :org-status duplicate)))
+               '("Org: Go to task" "Org: Set workflow state")))
+      (should-not (codex-ide-org-unregister-status-integration))
+      (should-not codex-ide-status-annotation-functions)
+      (should-not codex-ide-status-actions)
+      (should-not codex-ide-org-index-updated-hook))))
+
+(ert-deftest codex-ide-org-set-thread-workflow-is-explicit-and-persistent ()
+  (codex-ide-org-test-with-file
+      "* TODO Change state\n:PROPERTIES:\n:CODEX_THREAD_ID: state-thread\n:END:\n"
+    (let ((marker (codex-ide-org-set-thread-workflow "state-thread" "REVIEW")))
+      (should (equal (codex-ide-org-marker-workflow-state marker) "REVIEW"))
+      (with-current-buffer (marker-buffer marker)
+        (should-not (buffer-modified-p))))
+    (should-error (codex-ide-org-set-thread-workflow
+                   "state-thread" "TECHNICALLY-RUNNING")
+                  :type 'user-error)))
+
+(ert-deftest codex-ide-org-status-set-workflow-offers-configured-states ()
+  (codex-ide-org-test-with-file
+      "* WIP Pick state\n:PROPERTIES:\n:CODEX_THREAD_ID: pick-state\n:END:\n"
+    (let (offered initial)
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (_prompt choices _predicate _require-match
+                                  _initial-input _history default)
+                   (setq offered choices
+                         initial default)
+                   "HOLD")))
+        (codex-ide-org--status-set-workflow '(:thread-id "pick-state")))
+      (should (equal initial "WIP"))
+      (should (equal offered
+                     '("PLAN" "TODO" "WIP" "REVIEW" "HOLD"
+                       "DONE" "CANCELLED")))
+      (should (equal
+               (codex-ide-org-marker-workflow-state
+                (codex-ide-org-require-thread-marker "pick-state"))
+               "HOLD")))))
+
+(ert-deftest codex-ide-org-status-set-workflow-resolves-duplicate-once ()
+  (codex-ide-org-test-with-file
+      "* TODO First\n:PROPERTIES:\n:CODEX_THREAD_ID: duplicate-state\n:END:\n* REVIEW Second\n:PROPERTIES:\n:CODEX_THREAD_ID: duplicate-state\n:END:\n"
+    (let ((marker-selections 0))
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (_prompt choices &rest _)
+                   (if (consp (car choices))
+                       (progn
+                         (setq marker-selections (1+ marker-selections))
+                         (car (cadr choices)))
+                     "DONE"))))
+        (codex-ide-org--status-set-workflow
+         '(:thread-id "duplicate-state")))
+      (should (= marker-selections 1))
+      (let ((markers (plist-get
+                      (codex-ide-org-thread-state "duplicate-state") :markers)))
+        (should (equal (codex-ide-org-marker-workflow-state (cadr markers))
+                       "DONE"))))))
+
+(ert-deftest codex-ide-org-technical-events-do-not-change-workflow ()
+  (codex-ide-org-test-with-file
+      "* PLAN Remains planned\n:PROPERTIES:\n:CODEX_THREAD_ID: event-thread\n:END:\n"
+    (let ((codex-ide-org-status-integration-enabled-p t)
+          (notifications 0))
+      (cl-letf (((symbol-function 'codex-ide-status-notify-annotations-changed)
+                 (lambda () (setq notifications (1+ notifications)))))
+        (codex-ide-org--status-index-updated))
+      (should (= notifications 1))
+      (should (equal
+               (codex-ide-org-marker-workflow-state
+                (codex-ide-org-require-thread-marker "event-thread"))
+               "PLAN")))))
+
 (provide 'codex-ide-org-tests)
 
 ;;; codex-ide-org-tests.el ends here

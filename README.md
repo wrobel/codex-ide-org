@@ -69,6 +69,32 @@ and saves the configured file. Missing links report an error; duplicate links
 offer an explicit heading choice when navigating and are never silently
 collapsed.
 
+## Global status integration
+
+Work package 6 adds an optional status-view adapter. Register it explicitly:
+
+```emacs-lisp
+(codex-ide-org-register-status-integration)
+```
+
+Every global Codex row then shows a separate `Workflow:` annotation: its Org
+state, `UNLINKED`, or `DUPLICATE`. The existing technical state remains
+unchanged. On a session row, press `a` to choose an available Org action:
+
+- go to the linked task;
+- set the Org workflow state explicitly;
+- create a task when the thread is unlinked.
+
+Disable the adapter without changing any Org data:
+
+```emacs-lisp
+(codex-ide-org-unregister-status-integration)
+```
+
+Codex session events may refresh the display, but no technical state ever
+changes an Org workflow keyword. Profile-level activation is intentionally
+left to the next integration work package.
+
 ## Development
 
 The adjacent `emacs-codex-ide` checkout is used automatically for local tests:

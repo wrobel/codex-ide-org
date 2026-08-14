@@ -4,7 +4,7 @@
 
 ;; Author: Gunnar Wrobel
 ;; URL: https://github.com/wrobel/codex-ide-org
-;; Version: 0.2.0
+;; Version: 0.3.0
 ;; Package-Requires: ((emacs "28.1") (org "9.5") (codex-ide "0.3.2"))
 ;; Keywords: codex, ai, agents, outlines
 
@@ -51,6 +51,13 @@
 
 (defvar codex-ide-org-index-updated-hook nil
   "Hook run after `codex-ide-org-rebuild-index' completes.")
+
+(defvar codex-ide-org-status-integration-enabled-p nil
+  "Non-nil when Codex status annotations and actions are registered.")
+
+(defconst codex-ide-org--status-action-names
+  '("Org: Go to task" "Org: Set workflow state" "Org: Create task")
+  "Names of status actions owned by this package.")
 
 (defun codex-ide-org--set-file (symbol value)
   "Set SYMBOL to VALUE and rebuild an existing index."
@@ -454,6 +461,137 @@ This is the only work-package-5 operation that may create
     (codex-ide-org--display-marker marker)
     (message "Created Org task for Codex thread %s"
              (plist-get row :thread-id))))
+
+(defun codex-ide-org--row-thread-id (row)
+  "Return ROW's usable Codex thread ID, or nil."
+  (let ((thread-id (plist-get row :thread-id)))
+    (and (stringp thread-id)
+         (not (string-empty-p (string-trim thread-id)))
+         (string-trim thread-id))))
+
+(defun codex-ide-org--row-link-state (row)
+  "Return the Org link state for normalized Codex ROW, or nil."
+  (when-let* ((thread-id (codex-ide-org--row-thread-id row)))
+    (codex-ide-org-thread-state thread-id)))
+
+(defun codex-ide-org--workflow-face (state)
+  "Return an Org face suitable for workflow STATE."
+  (if (member state '("DONE" "CANCELLED")) 'org-done 'org-todo))
+
+(defun codex-ide-org-status-annotation (row)
+  "Return a clearly labelled Org workflow annotation for Codex ROW."
+  (when-let* ((link-state (codex-ide-org--row-link-state row)))
+    (pcase (plist-get link-state :status)
+      ('missing
+       (concat "Workflow: " (propertize "UNLINKED" 'face 'shadow)))
+      ('duplicate
+       (concat "Workflow: " (propertize "DUPLICATE" 'face 'error)))
+      ('linked
+       (let ((workflow
+              (or (codex-ide-org-marker-workflow-state
+                   (plist-get link-state :marker))
+                  "NONE")))
+         (concat "Workflow: "
+                 (propertize workflow
+                             'face (codex-ide-org--workflow-face workflow))))))))
+
+(defun codex-ide-org--row-missing-p (row)
+  "Return non-nil when Codex ROW has no linked Org task."
+  (eq (plist-get (codex-ide-org--row-link-state row) :status) 'missing))
+
+(defun codex-ide-org--row-navigable-p (row)
+  "Return non-nil when Codex ROW has one or more linked Org tasks."
+  (memq (plist-get (codex-ide-org--row-link-state row) :status)
+        '(linked duplicate)))
+
+(defun codex-ide-org--status-goto-task (row)
+  "Status action that jumps from Codex ROW to its Org task."
+  (codex-ide-org-goto-thread-task (codex-ide-org--row-thread-id row)))
+
+(defun codex-ide-org--status-create-task (row)
+  "Explicitly create and display a task for Codex ROW as a status action."
+  (let ((marker (codex-ide-org-create-task-for-row
+                 row (or (plist-get row :title) "Untitled Codex task"))))
+    (codex-ide-org--display-marker marker)
+    marker))
+
+(defun codex-ide-org--marker-workflow-keywords (marker)
+  "Return the available workflow keywords at Org MARKER."
+  (org-with-point-at marker
+    (copy-sequence org-todo-keywords-1)))
+
+(defun codex-ide-org--set-marker-workflow (marker workflow)
+  "Set Org MARKER to WORKFLOW explicitly and return a fresh marker."
+  (unless (member workflow (codex-ide-org--marker-workflow-keywords marker))
+    (user-error "Unknown Codex Org workflow state: %s" workflow))
+  (org-with-point-at marker
+    (org-back-to-heading t)
+    (org-todo workflow)
+    (codex-ide-org--save-and-refresh)
+    ;; Saving rebuilds the index and deliberately detaches its old markers.
+    ;; Return a fresh marker at the still-current heading.
+    (copy-marker (point))))
+
+(defun codex-ide-org-set-thread-workflow (thread-id workflow)
+  "Set linked THREAD-ID's Org WORKFLOW state explicitly and return its marker."
+  (codex-ide-org--set-marker-workflow
+   (codex-ide-org-resolve-thread-marker thread-id)
+   workflow))
+
+(defun codex-ide-org--status-set-workflow (row)
+  "Explicitly change the Org workflow for Codex ROW as a status action."
+  (let* ((thread-id (codex-ide-org--row-thread-id row))
+         (marker (codex-ide-org-resolve-thread-marker thread-id))
+         (keywords (codex-ide-org--marker-workflow-keywords marker))
+         (current (codex-ide-org-marker-workflow-state marker))
+         (workflow (completing-read "Org workflow state: " keywords nil t
+                                    nil nil current)))
+    (codex-ide-org--set-marker-workflow marker workflow)))
+
+(defun codex-ide-org--status-index-updated ()
+  "Refresh Codex status buffers after an external Org index update."
+  (when codex-ide-org-status-integration-enabled-p
+    (codex-ide-status-notify-annotations-changed)))
+
+;;;###autoload
+(defun codex-ide-org-register-status-integration ()
+  "Register Org workflow annotations and actions in Codex status views."
+  (interactive)
+  (unless codex-ide-org-status-integration-enabled-p
+    (add-hook 'codex-ide-status-annotation-functions
+              #'codex-ide-org-status-annotation)
+    ;; Registration prepends entries, so register in reverse display order.
+    (codex-ide-register-status-action
+     "Org: Create task"
+     #'codex-ide-org--status-create-task
+     #'codex-ide-org--row-missing-p)
+    (codex-ide-register-status-action
+     "Org: Set workflow state"
+     #'codex-ide-org--status-set-workflow
+     #'codex-ide-org--row-navigable-p)
+    (codex-ide-register-status-action
+     "Org: Go to task"
+     #'codex-ide-org--status-goto-task
+     #'codex-ide-org--row-navigable-p)
+    (add-hook 'codex-ide-org-index-updated-hook
+              #'codex-ide-org--status-index-updated)
+    (setq codex-ide-org-status-integration-enabled-p t)
+    (codex-ide-status-notify-annotations-changed))
+  codex-ide-org-status-integration-enabled-p)
+
+;;;###autoload
+(defun codex-ide-org-unregister-status-integration ()
+  "Remove this package's annotations and actions from Codex status views."
+  (interactive)
+  (remove-hook 'codex-ide-status-annotation-functions
+               #'codex-ide-org-status-annotation)
+  (dolist (name codex-ide-org--status-action-names)
+    (codex-ide-unregister-status-action name))
+  (remove-hook 'codex-ide-org-index-updated-hook
+               #'codex-ide-org--status-index-updated)
+  (setq codex-ide-org-status-integration-enabled-p nil)
+  (codex-ide-status-notify-annotations-changed)
+  codex-ide-org-status-integration-enabled-p)
 
 (add-hook 'org-mode-hook #'codex-ide-org--install-save-hook)
 (codex-ide-org-rebuild-index)
