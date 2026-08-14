@@ -94,6 +94,150 @@
           (should-not (file-exists-p codex-ide-org-file)))
       (delete-directory temporary-directory t))))
 
+(ert-deftest codex-ide-org-link-heading-persists-explicit-properties ()
+  (codex-ide-org-test-with-file "* TODO Link me\n"
+    (let ((buffer (get-file-buffer codex-ide-org-file)))
+      (with-current-buffer buffer
+        (goto-char (point-min))
+        (cl-letf (((symbol-function
+                    'codex-ide-status-notify-annotations-changed)
+                   #'ignore))
+          (codex-ide-org-link-heading "thread-link" "/tmp/link"))
+        (should (equal (org-entry-get nil "CODEX_THREAD_ID") "thread-link"))
+        (should (equal (org-entry-get nil "CODEX_CWD") "/tmp/link"))
+        (should-not (buffer-modified-p)))
+      (should (eq (plist-get (codex-ide-org-thread-state "thread-link") :status)
+                  'linked)))))
+
+(ert-deftest codex-ide-org-link-heading-refuses-existing-other-task ()
+  (codex-ide-org-test-with-file
+      "* TODO Existing\n:PROPERTIES:\n:CODEX_THREAD_ID: taken\n:END:\n* TODO Target\n"
+    (with-current-buffer (get-file-buffer codex-ide-org-file)
+      (goto-char (point-min))
+      (outline-next-heading)
+      (should-error (codex-ide-org-link-heading "taken") :type 'user-error)
+      (should-not (org-entry-get nil "CODEX_THREAD_ID")))))
+
+(ert-deftest codex-ide-org-link-heading-can-leave-change-unsaved ()
+  (codex-ide-org-test-with-file "* TODO Keep buffer change\n"
+    (with-current-buffer (get-file-buffer codex-ide-org-file)
+      (goto-char (point-min))
+      (let ((codex-ide-org-save-after-change nil))
+        (cl-letf (((symbol-function 'codex-ide-status-notify-annotations-changed)
+                   #'ignore))
+          (codex-ide-org-link-heading "unsaved")))
+      (should (buffer-modified-p))
+      (should (eq (plist-get (codex-ide-org-thread-state "unsaved") :status)
+                  'linked)))))
+
+(ert-deftest codex-ide-org-link-heading-requires-explicit-replacement ()
+  (codex-ide-org-test-with-file
+      "* TODO Existing\n:PROPERTIES:\n:CODEX_THREAD_ID: old\n:END:\n"
+    (with-current-buffer (get-file-buffer codex-ide-org-file)
+      (goto-char (point-min))
+      (should-error (codex-ide-org-link-heading "new") :type 'user-error)
+      (cl-letf (((symbol-function 'codex-ide-status-notify-annotations-changed)
+                 #'ignore))
+        (codex-ide-org-link-heading "new" "/tmp/new" t))
+      (should (equal (org-entry-get nil "CODEX_THREAD_ID") "new")))))
+
+(ert-deftest codex-ide-org-unlink-current-heading-confirms-and-persists ()
+  (codex-ide-org-test-with-file
+      "* WIP Linked\n:PROPERTIES:\n:CODEX_THREAD_ID: unlink-me\n:CODEX_CWD: /tmp/old\n:END:\n"
+    (with-current-buffer (get-file-buffer codex-ide-org-file)
+      (goto-char (point-min))
+      (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _) t))
+                ((symbol-function 'codex-ide-status-notify-annotations-changed)
+                 #'ignore))
+        (codex-ide-org-unlink-current-heading))
+      (should-not (org-entry-get nil "CODEX_THREAD_ID"))
+      (should-not (org-entry-get nil "CODEX_CWD"))
+      (should-not (buffer-modified-p)))
+    (should (eq (plist-get (codex-ide-org-thread-state "unlink-me") :status)
+                'missing))))
+
+(ert-deftest codex-ide-org-open-thread-at-point-uses-canonical-id ()
+  (codex-ide-org-test-with-file
+      "* TODO Open\n:PROPERTIES:\n:CODEX_THREAD_ID: open-me\n:CODEX_CWD: /stale/snapshot\n:END:\n"
+    (with-current-buffer (get-file-buffer codex-ide-org-file)
+      (goto-char (point-min))
+      (let (opened)
+        (cl-letf (((symbol-function 'codex-ide-open-thread)
+                   (lambda (&rest args) (setq opened args))))
+          (codex-ide-org-open-thread-at-point))
+        (should (equal opened '("open-me")))))))
+
+(ert-deftest codex-ide-org-resolve-thread-marker-asks-on-duplicate ()
+  (codex-ide-org-test-with-file
+      "* TODO First\n:PROPERTIES:\n:CODEX_THREAD_ID: duplicate-choice\n:END:\n* HOLD Second\n:PROPERTIES:\n:CODEX_THREAD_ID: duplicate-choice\n:END:\n"
+    (let* ((markers (plist-get (codex-ide-org-thread-state "duplicate-choice")
+                               :markers))
+           (second-marker (cadr markers)))
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (_prompt choices &rest _)
+                   (car (rassoc second-marker choices)))))
+        (should (eq (codex-ide-org-resolve-thread-marker "duplicate-choice")
+                    second-marker))))))
+
+(ert-deftest codex-ide-org-resolve-thread-marker-explains-missing-link ()
+  (codex-ide-org-test-with-file "* TODO Unlinked\n"
+    (should-error (codex-ide-org-resolve-thread-marker "not-linked")
+                  :type 'user-error)))
+
+(ert-deftest codex-ide-org-create-task-is-the-explicit-file-creation-path ()
+  (let* ((temporary-directory (make-temp-file "codex-ide-org-create-" t))
+         (codex-ide-org-file (expand-file-name "nested/tasks.org"
+                                               temporary-directory))
+         (row '(:thread-id "created-thread"
+                :title "Original title"
+                :directory "/tmp/created")))
+    (unwind-protect
+        (progn
+          (should-not (file-exists-p codex-ide-org-file))
+          (let ((marker (codex-ide-org-create-task-for-row
+                         row "Created\nOrg task")))
+            (should (file-exists-p codex-ide-org-file))
+            (org-with-point-at marker
+              (should (equal (org-get-heading t t t t) "Created Org task"))
+              (should (equal (org-entry-get nil "CODEX_THREAD_ID")
+                             "created-thread"))
+              (should (equal (org-entry-get nil "CODEX_CWD") "/tmp/created"))))
+          (should (eq (plist-get
+                       (codex-ide-org-thread-state "created-thread") :status)
+                      'linked)))
+      (when-let* ((buffer (get-file-buffer codex-ide-org-file)))
+        (kill-buffer buffer))
+      (delete-directory temporary-directory t))))
+
+(ert-deftest codex-ide-org-create-task-refuses-an-existing-link ()
+  (codex-ide-org-test-with-file
+      "* TODO Existing\n:PROPERTIES:\n:CODEX_THREAD_ID: existing-task\n:END:\n"
+    (should-error
+     (codex-ide-org-create-task-for-row
+      '(:thread-id "existing-task" :title "Duplicate") "Duplicate")
+     :type 'user-error)))
+
+(ert-deftest codex-ide-org-link-command-chooses-from-global-inventory ()
+  (codex-ide-org-test-with-file "* TODO Choose thread\n"
+    (with-current-buffer (get-file-buffer codex-ide-org-file)
+      (goto-char (point-min))
+      (let ((row '(:thread-id "global-choice"
+                   :title "Global choice"
+                   :directory "/tmp/global")))
+        (cl-letf (((symbol-function 'codex-ide-list-thread-rows)
+                   (lambda (&rest args)
+                     (should (equal args '(:global t)))
+                     (list row)))
+                  ((symbol-function 'completing-read)
+                   (lambda (_prompt choices &rest _)
+                     (caar choices)))
+                  ((symbol-function
+                    'codex-ide-status-notify-annotations-changed)
+                   #'ignore))
+          (codex-ide-org-link-current-heading)))
+      (should (equal (org-entry-get nil "CODEX_THREAD_ID") "global-choice"))
+      (should (equal (org-entry-get nil "CODEX_CWD") "/tmp/global")))))
+
 (provide 'codex-ide-org-tests)
 
 ;;; codex-ide-org-tests.el ends here

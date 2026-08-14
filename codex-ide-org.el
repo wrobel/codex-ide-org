@@ -4,7 +4,7 @@
 
 ;; Author: Gunnar Wrobel
 ;; URL: https://github.com/wrobel/codex-ide-org
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; Package-Requires: ((emacs "28.1") (org "9.5") (codex-ide "0.3.2"))
 ;; Keywords: codex, ai, agents, outlines
 
@@ -19,6 +19,7 @@
 (require 'org)
 (require 'seq)
 (require 'subr-x)
+(require 'codex-ide-status-api)
 
 (defgroup codex-ide-org nil
   "Org workflow data for Codex IDE threads."
@@ -73,6 +74,11 @@ commands may create it."
               "|" "DONE(d)" "CANCELLED(c)"))
   "Buffer-local workflow sequence for `codex-ide-org-file'."
   :type 'sexp
+  :group 'codex-ide-org)
+
+(defcustom codex-ide-org-save-after-change t
+  "When non-nil, save the Org task file after explicit link changes."
+  :type 'boolean
   :group 'codex-ide-org)
 
 (defun codex-ide-org--expanded-file ()
@@ -217,6 +223,237 @@ contains that marker as a convenience."
   "Return MARKER's Org TODO keyword, or nil."
   (org-with-point-at marker
     (org-get-todo-state)))
+
+(defun codex-ide-org--require-task-heading ()
+  "Move to and return the current heading in the configured task file."
+  (unless (derived-mode-p 'org-mode)
+    (user-error "This command must be used from an Org heading"))
+  (unless (and buffer-file-name
+               (codex-ide-org--same-file-p buffer-file-name codex-ide-org-file))
+    (user-error "This heading is not in the configured Codex task file: %s"
+                (codex-ide-org--expanded-file)))
+  (org-back-to-heading t)
+  (copy-marker (point)))
+
+(defun codex-ide-org--notify-changed ()
+  "Notify Codex status consumers that Org link data changed."
+  (when (fboundp 'codex-ide-status-notify-annotations-changed)
+    (codex-ide-status-notify-annotations-changed)))
+
+(defun codex-ide-org--save-and-refresh ()
+  "Persist or re-index the current task buffer and notify consumers."
+  (if codex-ide-org-save-after-change
+      (save-buffer)
+    (codex-ide-org-rebuild-index))
+  (codex-ide-org--notify-changed))
+
+(defun codex-ide-org--row-label (row)
+  "Return an unambiguous completion label for normalized thread ROW."
+  (format "%s — %s — %s"
+          (or (plist-get row :title) "Untitled")
+          (or (plist-get row :directory) "no working directory")
+          (plist-get row :thread-id)))
+
+(defun codex-ide-org--global-thread-rows ()
+  "Return global normalized rows that have a usable thread ID."
+  (seq-filter
+   (lambda (row)
+     (let ((thread-id (plist-get row :thread-id)))
+       (and (stringp thread-id) (not (string-empty-p thread-id)))))
+   (codex-ide-list-thread-rows :global t)))
+
+(defun codex-ide-org--read-thread-row (prompt &optional predicate)
+  "Read a global thread row using PROMPT, optionally limited by PREDICATE."
+  (let* ((rows (if predicate
+                   (seq-filter predicate (codex-ide-org--global-thread-rows))
+                 (codex-ide-org--global-thread-rows)))
+         (choices (mapcar (lambda (row)
+                            (cons (codex-ide-org--row-label row) row))
+                          rows)))
+    (unless choices
+      (user-error "No matching Codex threads were found"))
+    (cdr (assoc (completing-read prompt choices nil t) choices))))
+
+(defun codex-ide-org--marker-at-current-heading-p (marker)
+  "Return non-nil when MARKER identifies the current Org heading."
+  (and (markerp marker)
+       (eq (marker-buffer marker) (current-buffer))
+       (= (marker-position marker) (point))))
+
+(defun codex-ide-org-link-heading (thread-id &optional directory replace)
+  "Link the current task heading to THREAD-ID and snapshot DIRECTORY.
+
+THREAD-ID must not already identify another heading.  When the current heading
+already has a different ID, REPLACE must be non-nil.  This function does not
+infer links from titles or directories."
+  (unless (and (stringp thread-id) (not (string-empty-p (string-trim thread-id))))
+    (user-error "A non-empty Codex thread ID is required"))
+  (setq thread-id (string-trim thread-id))
+  (codex-ide-org--require-task-heading)
+  (codex-ide-org-rebuild-index)
+  (let* ((existing-id (org-entry-get nil codex-ide-org-thread-id-property nil))
+         (markers (codex-ide-org-index-markers thread-id))
+         (other-markers
+          (seq-remove #'codex-ide-org--marker-at-current-heading-p markers)))
+    (when other-markers
+      (user-error "Codex thread %s is already linked to another Org task"
+                  thread-id))
+    (when (and existing-id
+               (not (equal (string-trim existing-id) thread-id))
+               (not replace))
+      (user-error "This task is already linked to Codex thread %s" existing-id))
+    (org-entry-put nil codex-ide-org-thread-id-property thread-id)
+    (when (and (stringp directory) (not (string-empty-p directory)))
+      (org-entry-put nil codex-ide-org-directory-property directory))
+    (codex-ide-org--save-and-refresh)
+    (codex-ide-org-require-thread-marker thread-id)))
+
+;;;###autoload
+(defun codex-ide-org-link-current-heading ()
+  "Choose a global Codex thread and link it to the current Org heading."
+  (interactive)
+  (codex-ide-org--require-task-heading)
+  (let* ((row (codex-ide-org--read-thread-row "Link Codex thread: "))
+         (thread-id (plist-get row :thread-id))
+         (existing-id (org-entry-get nil codex-ide-org-thread-id-property nil))
+         (replace (or (null existing-id)
+                      (equal existing-id thread-id)
+                      (yes-or-no-p
+                       (format "Replace existing Codex link %s? " existing-id)))))
+    (unless replace
+      (user-error "Codex thread link was not changed"))
+    (codex-ide-org-link-heading thread-id (plist-get row :directory) replace)
+    (message "Linked Org task to Codex thread %s" thread-id)))
+
+;;;###autoload
+(defun codex-ide-org-unlink-current-heading ()
+  "Remove the current Org heading's Codex link after confirmation."
+  (interactive)
+  (codex-ide-org--require-task-heading)
+  (let ((thread-id (org-entry-get nil codex-ide-org-thread-id-property nil)))
+    (unless thread-id
+      (user-error "This Org task is not linked to a Codex thread"))
+    (unless (yes-or-no-p (format "Unlink Codex thread %s? " thread-id))
+      (user-error "Codex thread link was not removed"))
+    (org-entry-delete nil codex-ide-org-thread-id-property)
+    (org-entry-delete nil codex-ide-org-directory-property)
+    (codex-ide-org--save-and-refresh)
+    (message "Unlinked Codex thread %s" thread-id)))
+
+;;;###autoload
+(defun codex-ide-org-open-thread-at-point ()
+  "Open the Codex thread linked to the current Org heading."
+  (interactive)
+  (codex-ide-org--require-task-heading)
+  (let ((thread-id (org-entry-get nil codex-ide-org-thread-id-property nil)))
+    (unless thread-id
+      (user-error "This Org task is not linked to a Codex thread"))
+    ;; Resolve the current directory from Codex.  CODEX_CWD is only a snapshot.
+    (codex-ide-open-thread thread-id)))
+
+(defun codex-ide-org--marker-label (marker)
+  "Return a completion label for an Org heading at MARKER."
+  (org-with-point-at marker
+    (format "%s — %s:%d"
+            (org-get-heading t t t t)
+            (or buffer-file-name (buffer-name))
+            (line-number-at-pos))))
+
+(defun codex-ide-org-resolve-thread-marker (thread-id)
+  "Return an Org marker for THREAD-ID, asking when duplicates exist."
+  (let* ((state (codex-ide-org-thread-state thread-id))
+         (markers (plist-get state :markers)))
+    (pcase (plist-get state :status)
+      ('missing
+       (user-error "No Org task is linked to Codex thread %s" thread-id))
+      ('linked (car markers))
+      ('duplicate
+       (let ((choices (mapcar (lambda (marker)
+                                (cons (codex-ide-org--marker-label marker) marker))
+                              markers)))
+         (cdr (assoc (completing-read
+                      (format "Multiple Org tasks link %s; choose: " thread-id)
+                      choices nil t)
+                     choices)))))))
+
+(defun codex-ide-org--display-marker (marker)
+  "Display the Org heading at MARKER and return MARKER."
+  (pop-to-buffer-same-window (marker-buffer marker))
+  (goto-char marker)
+  (if (fboundp 'org-fold-show-context)
+      (org-fold-show-context)
+    (with-no-warnings (org-show-context)))
+  (if (fboundp 'org-fold-show-entry)
+      (org-fold-show-entry)
+    (with-no-warnings (org-show-entry)))
+  marker)
+
+;;;###autoload
+(defun codex-ide-org-goto-thread-task (thread-id)
+  "Jump to the Org task linked to Codex THREAD-ID.
+
+Interactively, choose THREAD-ID from the global Codex inventory."
+  (interactive
+   (list (plist-get (codex-ide-org--read-thread-row "Go to Org task for: ")
+                    :thread-id)))
+  (codex-ide-org--display-marker
+   (codex-ide-org-resolve-thread-marker thread-id)))
+
+(defun codex-ide-org--task-title (title)
+  "Return TITLE normalized for a single Org heading line."
+  (let ((title (string-trim (replace-regexp-in-string "[\n\r]+" " " title))))
+    (if (string-empty-p title) "Untitled Codex task" title)))
+
+(defun codex-ide-org-create-task-for-row (row title)
+  "Create and persist an Org task for unlinked Codex ROW using TITLE.
+
+This is the only work-package-5 operation that may create
+`codex-ide-org-file' and its parent directory."
+  (let ((thread-id (plist-get row :thread-id))
+        (directory (plist-get row :directory)))
+    (unless (and (stringp thread-id) (not (string-empty-p thread-id)))
+      (user-error "The Codex row has no usable thread ID"))
+    (pcase (plist-get (codex-ide-org-thread-state thread-id) :status)
+      ('linked (user-error "Codex thread %s already has an Org task" thread-id))
+      ('duplicate (user-error "Codex thread %s has multiple Org tasks" thread-id)))
+    (make-directory (file-name-directory (codex-ide-org--expanded-file)) t)
+    (let ((buffer (find-file-noselect (codex-ide-org--expanded-file))))
+      (with-current-buffer buffer
+        (unless (derived-mode-p 'org-mode)
+          (org-mode))
+        (codex-ide-org--install-save-hook)
+        (goto-char (point-max))
+        (unless (or (= (point-min) (point-max)) (bolp))
+          (insert "\n"))
+        (insert "* TODO " (codex-ide-org--task-title title) "\n")
+        (forward-line -1)
+        (org-entry-put nil codex-ide-org-thread-id-property thread-id)
+        (when (and (stringp directory) (not (string-empty-p directory)))
+          (org-entry-put nil codex-ide-org-directory-property directory))
+        ;; Explicit task creation is always persisted, independent of the
+        ;; link-change preference.
+        (save-buffer)
+        (codex-ide-org--notify-changed)
+        (codex-ide-org-require-thread-marker thread-id)))))
+
+;;;###autoload
+(defun codex-ide-org-create-thread-task ()
+  "Choose an unlinked global Codex thread and create its Org task explicitly."
+  (interactive)
+  (let* ((row (codex-ide-org--read-thread-row
+               "Create Org task for: "
+               (lambda (candidate)
+                 (eq (plist-get
+                      (codex-ide-org-thread-state
+                       (plist-get candidate :thread-id))
+                      :status)
+                     'missing))))
+         (default-title (or (plist-get row :title) "Untitled Codex task"))
+         (title (read-string "Org task title: " nil nil default-title))
+         (marker (codex-ide-org-create-task-for-row row title)))
+    (codex-ide-org--display-marker marker)
+    (message "Created Org task for Codex thread %s"
+             (plist-get row :thread-id))))
 
 (add-hook 'org-mode-hook #'codex-ide-org--install-save-hook)
 (codex-ide-org-rebuild-index)

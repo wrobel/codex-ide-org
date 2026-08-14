@@ -10,10 +10,10 @@ The package keeps two kinds of status separate:
 - Org owns the explicit workflow state such as `PLAN`, `TODO`, `WIP`, `REVIEW`,
   `HOLD`, `DONE`, and `CANCELLED`.
 
-## Current scope
+## Data model
 
-The first implementation provides only the work-package-4 data model and
-index. It does not yet create, link, unlink, or navigate tasks.
+The package provides an explicit data model and navigation commands. It never
+matches Org tasks heuristically by title or directory.
 
 Linked headings use:
 
@@ -50,6 +50,24 @@ PLAN TODO WIP REVIEW HOLD | DONE CANCELLED
 ```
 
 Other Org files and global TODO settings are not modified.
+
+## Commands
+
+- `M-x codex-ide-org-link-current-heading` chooses a thread from the global
+  Codex inventory and links the current heading.
+- `M-x codex-ide-org-unlink-current-heading` removes both link properties after
+  confirmation.
+- `M-x codex-ide-org-open-thread-at-point` opens the linked Codex thread.
+- `M-x codex-ide-org-goto-thread-task` chooses a global thread and jumps to its
+  linked task.
+- `M-x codex-ide-org-create-thread-task` explicitly creates a new task for an
+  unlinked global thread.
+
+Link changes are saved by default. Set `codex-ide-org-save-after-change` to nil
+to leave link and unlink changes unsaved. Explicit task creation always creates
+and saves the configured file. Missing links report an error; duplicate links
+offer an explicit heading choice when navigating and are never silently
+collapsed.
 
 ## Development
 
