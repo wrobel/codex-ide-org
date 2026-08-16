@@ -47,13 +47,25 @@ For a project-local pilot, resolve one file below each Emacs project root:
 
 ```emacs-lisp
 (setq codex-ide-org-file-function #'codex-ide-org-project-file
-      codex-ide-org-project-file-name ".codex-ide/tasks.org")
+      codex-ide-org-project-file-name "project/tasks.org")
 ```
 
 Only an explicit task-creation command creates the project file. The package
 does not scan every project to build a global Org register. Interactive thread
 selection is project-scoped by default; set `codex-ide-org-thread-list-scope`
 to `global` to opt back into the complete Codex inventory.
+
+Override individual projects centrally when their layout differs:
+
+```emacs-lisp
+(setq codex-ide-org-project-file-alist
+      '(("/path/to/special-project/\\'" . "planning/codex-tasks.org")
+        ("/path/to/other-project/\\'" . "/absolute/path/tasks.org")))
+```
+
+The first matching project-root regular expression wins. Relative file names
+are resolved below that project root. For completely custom lookup rules,
+replace `codex-ide-org-file-function` with a user-defined function.
 
 The selected workflow sequence is installed buffer-locally only in that file:
 

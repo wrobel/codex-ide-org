@@ -282,6 +282,25 @@
         (when (buffer-live-p buffer) (kill-buffer buffer)))
       (delete-directory temporary-directory t))))
 
+(ert-deftest codex-ide-org-project-file-alist-overrides-one-project ()
+  (let* ((temporary-directory (make-temp-file "codex-ide-org-paths-" t))
+         (special-project (expand-file-name "special" temporary-directory))
+         (regular-project (expand-file-name "regular" temporary-directory))
+         (codex-ide-org-project-file-name "project/tasks.org")
+         (codex-ide-org-project-file-alist
+          `((,(regexp-quote special-project) . "planning/codex.org"))))
+    (unwind-protect
+        (progn
+          (make-directory special-project t)
+          (make-directory regular-project t)
+          (should (equal (codex-ide-org-project-file special-project)
+                         (expand-file-name "planning/codex.org"
+                                           special-project)))
+          (should (equal (codex-ide-org-project-file regular-project)
+                         (expand-file-name "project/tasks.org"
+                                           regular-project))))
+      (delete-directory temporary-directory t))))
+
 (ert-deftest codex-ide-org-created-project-task-immediately-annotates-row ()
   (let* ((temporary-directory (make-temp-file "codex-ide-org-annotation-" t))
          (codex-ide-org-file-function
@@ -299,6 +318,41 @@
                          "Workflow: TODO")))
       (when (buffer-live-p buffer) (kill-buffer buffer))
       (delete-directory temporary-directory t))))
+
+(ert-deftest codex-ide-org-reopens-killed-task-buffer-before-status-lookup ()
+  (let* ((temporary-directory (make-temp-file "codex-ide-org-reopen-" t))
+         (codex-ide-org-file-function
+          (lambda (directory)
+            (expand-file-name ".codex-ide/tasks.org" directory)))
+         (row `(:thread-id "reopened-thread" :directory ,temporary-directory))
+         (marker (codex-ide-org-create-task-for-row row "Reopen task"))
+         (buffer (marker-buffer marker)))
+    (unwind-protect
+        (progn
+          (kill-buffer buffer)
+          (should-not (marker-buffer marker))
+          (should (equal (substring-no-properties
+                          (codex-ide-org-status-annotation row))
+                         "Workflow: TODO"))
+          (should (codex-ide-org--row-navigable-p row))
+          (should-not (codex-ide-org--row-missing-p row)))
+      (when-let* ((task-buffer
+                   (get-file-buffer
+                    (expand-file-name ".codex-ide/tasks.org"
+                                      temporary-directory))))
+        (kill-buffer task-buffer))
+      (delete-directory temporary-directory t))))
+
+(ert-deftest codex-ide-org-create-task-rechecks-file-before-writing ()
+  (codex-ide-org-test-with-file
+      "* TODO Existing\n:PROPERTIES:\n:CODEX_THREAD_ID: on-disk\n:END:\n"
+    (codex-ide-org--clear-index)
+    (should-error
+     (codex-ide-org-create-task-for-row
+      '(:thread-id "on-disk" :directory "/tmp/project") "Duplicate")
+     :type 'user-error)
+    (with-current-buffer (get-file-buffer codex-ide-org-file)
+      (should (= (how-many "^\\* TODO Existing$" (point-min) (point-max)) 1)))))
 
 (ert-deftest codex-ide-org-global-status-annotation-is-opt-in ()
   (let ((codex-ide-status-mode--global-p t)

@@ -4,7 +4,7 @@
 
 ;; Author: Gunnar Wrobel
 ;; URL: https://github.com/wrobel/codex-ide-org
-;; Version: 0.4.0
+;; Version: 0.4.1
 ;; Package-Requires: ((emacs "28.1") (org "9.5") (codex-ide "0.3.2"))
 ;; Keywords: codex, ai, agents, outlines
 
@@ -97,6 +97,15 @@ package never creates a resolved file."
   :type 'string
   :group 'codex-ide-org)
 
+(defcustom codex-ide-org-project-file-alist nil
+  "Project-specific task file overrides.
+
+Each entry is (REGEXP . FILE).  REGEXP is matched against the expanded project
+root and the first match wins.  FILE may be relative to that root or absolute.
+Projects without a match use `codex-ide-org-project-file-name'."
+  :type '(alist :key-type regexp :value-type file)
+  :group 'codex-ide-org)
+
 (defcustom codex-ide-org-thread-list-scope 'project
   "Scope used by interactive Codex thread selection commands."
   :type '(choice (const :tag "Current project" project)
@@ -130,8 +139,15 @@ Use the containing Emacs project root when available and otherwise treat
 DIRECTORY itself as the root."
   (let* ((directory (file-name-as-directory (expand-file-name directory)))
          (project (project-current nil directory))
-         (root (if project (project-root project) directory)))
-    (expand-file-name codex-ide-org-project-file-name root)))
+         (root (file-name-as-directory
+                (expand-file-name (if project (project-root project) directory))))
+         (override (seq-find (lambda (entry)
+                               (string-match-p (car entry) root))
+                             codex-ide-org-project-file-alist))
+         (file (if override
+                   (cdr override)
+                 codex-ide-org-project-file-name)))
+    (expand-file-name file root)))
 
 (defun codex-ide-org--context-directory (&optional directory)
   "Return DIRECTORY or the most useful current directory context."
@@ -235,9 +251,14 @@ configured file is not created when it does not exist."
   (codex-ide-org--rebuild-file (codex-ide-org--expanded-file directory)))
 
 (defun codex-ide-org--ensure-current-index (&optional directory)
-  "Rebuild when the configured file differs from the indexed file."
+  "Ensure a live index for the configured file in DIRECTORY.
+
+Rebuild after the task buffer was killed because its stored Org markers are no
+longer usable even when the resolved file name itself did not change."
   (let ((file (codex-ide-org--expanded-file directory)))
-    (unless (codex-ide-org--same-file-p codex-ide-org--indexed-file file)
+    (unless (and (codex-ide-org--same-file-p codex-ide-org--indexed-file file)
+                 (or (not (file-readable-p file))
+                     (get-file-buffer file)))
       (codex-ide-org--rebuild-file file))))
 
 (defun codex-ide-org-index-markers (thread-id &optional directory)
@@ -495,6 +516,10 @@ This is the only work-package-5 operation that may create
          (file (codex-ide-org--expanded-file directory)))
     (unless (and (stringp thread-id) (not (string-empty-p thread-id)))
       (user-error "The Codex row has no usable thread ID"))
+    ;; Creation is the only operation that can introduce a duplicate.  Read the
+    ;; target file afresh so even stale or externally invalidated markers can
+    ;; never make an existing link appear absent.
+    (codex-ide-org--rebuild-file file)
     (pcase (plist-get (codex-ide-org-thread-state thread-id directory) :status)
       ('linked (user-error "Codex thread %s already has an Org task" thread-id))
       ('duplicate (user-error "Codex thread %s has multiple Org tasks" thread-id)))
