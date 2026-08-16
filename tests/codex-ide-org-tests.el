@@ -6,6 +6,8 @@
 (require 'org)
 (require 'codex-ide-org)
 
+(defvar codex-ide-status-mode--global-p)
+
 (defmacro codex-ide-org-test-with-file (contents &rest body)
   "Create a temporary Org file containing CONTENTS and evaluate BODY."
   (declare (indent 1) (debug t))
@@ -156,7 +158,7 @@
     (should (eq (plist-get (codex-ide-org-thread-state "unlink-me") :status)
                 'missing))))
 
-(ert-deftest codex-ide-org-open-thread-at-point-uses-canonical-id ()
+(ert-deftest codex-ide-org-open-thread-at-point-uses-id-and-directory-snapshot ()
   (codex-ide-org-test-with-file
       "* TODO Open\n:PROPERTIES:\n:CODEX_THREAD_ID: open-me\n:CODEX_CWD: /stale/snapshot\n:END:\n"
     (with-current-buffer (get-file-buffer codex-ide-org-file)
@@ -165,7 +167,7 @@
         (cl-letf (((symbol-function 'codex-ide-open-thread)
                    (lambda (&rest args) (setq opened args))))
           (codex-ide-org-open-thread-at-point))
-        (should (equal opened '("open-me")))))))
+        (should (equal opened '("open-me" "/stale/snapshot")))))))
 
 (ert-deftest codex-ide-org-resolve-thread-marker-asks-on-duplicate ()
   (codex-ide-org-test-with-file
@@ -217,7 +219,7 @@
       '(:thread-id "existing-task" :title "Duplicate") "Duplicate")
      :type 'user-error)))
 
-(ert-deftest codex-ide-org-link-command-chooses-from-global-inventory ()
+(ert-deftest codex-ide-org-link-command-chooses-from-project-inventory ()
   (codex-ide-org-test-with-file "* TODO Choose thread\n"
     (with-current-buffer (get-file-buffer codex-ide-org-file)
       (goto-char (point-min))
@@ -226,7 +228,7 @@
                    :directory "/tmp/global")))
         (cl-letf (((symbol-function 'codex-ide-list-thread-rows)
                    (lambda (&rest args)
-                     (should (equal args '(:global t)))
+                     (should (equal args (list :directory default-directory)))
                      (list row)))
                   ((symbol-function 'completing-read)
                    (lambda (_prompt choices &rest _)
@@ -237,6 +239,73 @@
           (codex-ide-org-link-current-heading)))
       (should (equal (org-entry-get nil "CODEX_THREAD_ID") "global-choice"))
       (should (equal (org-entry-get nil "CODEX_CWD") "/tmp/global")))))
+
+(ert-deftest codex-ide-org-thread-selection-can-opt-in-to-global-inventory ()
+  (let ((codex-ide-org-thread-list-scope 'global))
+    (cl-letf (((symbol-function 'codex-ide-list-thread-rows)
+               (lambda (&rest args)
+                 (should (equal args '(:global t)))
+                 (list '(:thread-id "global" :directory "/tmp/global")))))
+      (should (equal (plist-get (car (codex-ide-org--thread-rows)) :thread-id)
+                     "global")))))
+
+(ert-deftest codex-ide-org-project-files-keep-project-indexes-separate ()
+  (let* ((temporary-directory (make-temp-file "codex-ide-org-projects-" t))
+         (project-one (expand-file-name "one" temporary-directory))
+         (project-two (expand-file-name "two" temporary-directory))
+         (codex-ide-org-file-function
+          (lambda (directory)
+            (expand-file-name ".codex-ide/tasks.org" directory)))
+         buffers)
+    (unwind-protect
+        (progn
+          (make-directory project-one t)
+          (make-directory project-two t)
+          (dolist (row `((:thread-id "one-thread" :directory ,project-one)
+                         (:thread-id "two-thread" :directory ,project-two)))
+            (push (marker-buffer
+                   (codex-ide-org-create-task-for-row row "Project task"))
+                  buffers))
+          (should (eq (plist-get
+                       (codex-ide-org-thread-state "one-thread" project-one)
+                       :status)
+                      'linked))
+          (should (eq (plist-get
+                       (codex-ide-org-thread-state "one-thread" project-two)
+                       :status)
+                      'missing))
+          (should (file-exists-p
+                   (expand-file-name ".codex-ide/tasks.org" project-one)))
+          (should (file-exists-p
+                   (expand-file-name ".codex-ide/tasks.org" project-two))))
+      (dolist (buffer buffers)
+        (when (buffer-live-p buffer) (kill-buffer buffer)))
+      (delete-directory temporary-directory t))))
+
+(ert-deftest codex-ide-org-created-project-task-immediately-annotates-row ()
+  (let* ((temporary-directory (make-temp-file "codex-ide-org-annotation-" t))
+         (codex-ide-org-file-function
+          (lambda (directory)
+            (expand-file-name ".codex-ide/tasks.org" directory)))
+         (row `(:thread-id "fresh-thread" :directory ,temporary-directory))
+         buffer)
+    (unwind-protect
+        (progn
+          (setq buffer
+                (marker-buffer
+                 (codex-ide-org-create-task-for-row row "Fresh task")))
+          (should (equal (substring-no-properties
+                          (codex-ide-org-status-annotation row))
+                         "Workflow: TODO")))
+      (when (buffer-live-p buffer) (kill-buffer buffer))
+      (delete-directory temporary-directory t))))
+
+(ert-deftest codex-ide-org-global-status-annotation-is-opt-in ()
+  (let ((codex-ide-status-mode--global-p t)
+        (codex-ide-org-annotate-global-status nil))
+    (should-not
+     (codex-ide-org-status-annotation
+      '(:thread-id "not-read" :directory "/tmp/project")))))
 
 (ert-deftest codex-ide-org-status-annotation-separates-workflow-from-runtime ()
   (codex-ide-org-test-with-file

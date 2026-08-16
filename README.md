@@ -43,6 +43,18 @@ before loading when needed:
 (require 'codex-ide-org)
 ```
 
+For a project-local pilot, resolve one file below each Emacs project root:
+
+```emacs-lisp
+(setq codex-ide-org-file-function #'codex-ide-org-project-file
+      codex-ide-org-project-file-name ".codex-ide/tasks.org")
+```
+
+Only an explicit task-creation command creates the project file. The package
+does not scan every project to build a global Org register. Interactive thread
+selection is project-scoped by default; set `codex-ide-org-thread-list-scope`
+to `global` to opt back into the complete Codex inventory.
+
 The selected workflow sequence is installed buffer-locally only in that file:
 
 ```text
@@ -53,15 +65,15 @@ Other Org files and global TODO settings are not modified.
 
 ## Commands
 
-- `M-x codex-ide-org-link-current-heading` chooses a thread from the global
-  Codex inventory and links the current heading.
+- `M-x codex-ide-org-link-current-heading` chooses a thread from the current
+  project and links the current heading.
 - `M-x codex-ide-org-unlink-current-heading` removes both link properties after
   confirmation.
 - `M-x codex-ide-org-open-thread-at-point` opens the linked Codex thread.
-- `M-x codex-ide-org-goto-thread-task` chooses a global thread and jumps to its
+- `M-x codex-ide-org-goto-thread-task` chooses a project thread and jumps to its
   linked task.
 - `M-x codex-ide-org-create-thread-task` explicitly creates a new task for an
-  unlinked global thread.
+  unlinked project thread.
 
 Link changes are saved by default. Set `codex-ide-org-save-after-change` to nil
 to leave link and unlink changes unsaved. Explicit task creation always creates
@@ -69,7 +81,7 @@ and saves the configured file. Missing links report an error; duplicate links
 offer an explicit heading choice when navigating and are never silently
 collapsed.
 
-## Global status integration
+## Status integration
 
 Work package 6 adds an optional status-view adapter. Register it explicitly:
 
@@ -77,9 +89,10 @@ Work package 6 adds an optional status-view adapter. Register it explicitly:
 (codex-ide-org-register-status-integration)
 ```
 
-Every global Codex row then shows a separate `Workflow:` annotation: its Org
-state, `UNLINKED`, or `DUPLICATE`. The existing technical state remains
-unchanged. On a session row, press `a` to choose an available Org action:
+Every row in `M-x codex-ide-status` then shows a separate `Workflow:`
+annotation: its Org state, `UNLINKED`, or `DUPLICATE`. The existing technical
+state remains unchanged. On a session row, press `a` to choose an available
+Org action:
 
 - go to the linked task;
 - set the Org workflow state explicitly;
@@ -93,7 +106,9 @@ Disable the adapter without changing any Org data:
 
 Codex session events may refresh the display, but no technical state ever
 changes an Org workflow keyword. Profile-level activation is intentionally
-left to the next integration work package.
+separate. Global status annotations are disabled by default because resolving
+them can read one task file per project; set
+`codex-ide-org-annotate-global-status` to non-nil to opt in.
 
 ## Development
 

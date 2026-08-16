@@ -4,7 +4,7 @@
 
 ;; Author: Gunnar Wrobel
 ;; URL: https://github.com/wrobel/codex-ide-org
-;; Version: 0.3.0
+;; Version: 0.4.0
 ;; Package-Requires: ((emacs "28.1") (org "9.5") (codex-ide "0.3.2"))
 ;; Keywords: codex, ai, agents, outlines
 
@@ -17,9 +17,12 @@
 
 (require 'cl-lib)
 (require 'org)
+(require 'project)
 (require 'seq)
 (require 'subr-x)
 (require 'codex-ide-status-api)
+
+(defvar codex-ide-status-mode--global-p)
 
 (defgroup codex-ide-org nil
   "Org workflow data for Codex IDE threads."
@@ -45,6 +48,9 @@
 
 (defvar codex-ide-org--indexed-file nil
   "Expanded file name used for the current index contents.")
+
+(defvar-local codex-ide-org--buffer-task-file nil
+  "Resolved Codex Org task file associated with the current buffer.")
 
 (defvar codex-ide-org-index-generation 0
   "Number of completed index rebuilds in this Emacs process.")
@@ -76,6 +82,35 @@ commands may create it."
   :set #'codex-ide-org--set-file
   :group 'codex-ide-org)
 
+(defcustom codex-ide-org-file-function nil
+  "Optional function that resolves the Org task file for a directory.
+
+The function receives a Codex working directory and must return a file name.
+When nil, `codex-ide-org-file' remains the single task file.  Loading this
+package never creates a resolved file."
+  :type '(choice (const :tag "Use codex-ide-org-file" nil) function)
+  :set #'codex-ide-org--set-file
+  :group 'codex-ide-org)
+
+(defcustom codex-ide-org-project-file-name ".codex-ide/tasks.org"
+  "File name below a project root used by `codex-ide-org-project-file'."
+  :type 'string
+  :group 'codex-ide-org)
+
+(defcustom codex-ide-org-thread-list-scope 'project
+  "Scope used by interactive Codex thread selection commands."
+  :type '(choice (const :tag "Current project" project)
+                 (const :tag "All projects" global))
+  :group 'codex-ide-org)
+
+(defcustom codex-ide-org-annotate-global-status nil
+  "When non-nil, resolve Org annotations in the global Codex status view.
+
+This can require reading one Org file per project.  Project status views are
+always annotated when the status integration is registered."
+  :type 'boolean
+  :group 'codex-ide-org)
+
 (defcustom codex-ide-org-todo-keywords
   '((sequence "PLAN(p)" "TODO(t)" "WIP(w)" "REVIEW(r)" "HOLD(h)"
               "|" "DONE(d)" "CANCELLED(c)"))
@@ -88,9 +123,30 @@ commands may create it."
   :type 'boolean
   :group 'codex-ide-org)
 
-(defun codex-ide-org--expanded-file ()
-  "Return the expanded configured Org file name."
-  (expand-file-name codex-ide-org-file))
+(defun codex-ide-org-project-file (directory)
+  "Return the project-local Codex Org file for DIRECTORY.
+
+Use the containing Emacs project root when available and otherwise treat
+DIRECTORY itself as the root."
+  (let* ((directory (file-name-as-directory (expand-file-name directory)))
+         (project (project-current nil directory))
+         (root (if project (project-root project) directory)))
+    (expand-file-name codex-ide-org-project-file-name root)))
+
+(defun codex-ide-org--context-directory (&optional directory)
+  "Return DIRECTORY or the most useful current directory context."
+  (or directory
+      (and (derived-mode-p 'org-mode)
+           (org-entry-get nil codex-ide-org-directory-property nil))
+      default-directory))
+
+(defun codex-ide-org--expanded-file (&optional directory)
+  "Return the expanded configured Org file for DIRECTORY."
+  (expand-file-name
+   (if codex-ide-org-file-function
+       (funcall codex-ide-org-file-function
+                (codex-ide-org--context-directory directory))
+     codex-ide-org-file)))
 
 (defun codex-ide-org--same-file-p (left right)
   "Return non-nil when LEFT and RIGHT name the same expanded file."
@@ -120,35 +176,35 @@ those expressions keeps the resulting workflow local to the configured file."
           (org-set-regexps-and-options))
       (set-default 'org-todo-keywords previous-default))))
 
-(defun codex-ide-org--install-save-hook ()
-  "Install index maintenance when visiting `codex-ide-org-file'."
-  (when (and buffer-file-name
-             (codex-ide-org--same-file-p buffer-file-name codex-ide-org-file))
-    (codex-ide-org--configure-workflow)
-    (add-hook 'after-save-hook #'codex-ide-org--after-save nil t)))
+(defun codex-ide-org--install-save-hook (&optional task-file)
+  "Install index maintenance when visiting resolved TASK-FILE."
+  (let ((task-file (or task-file
+                       codex-ide-org--buffer-task-file
+                       (and buffer-file-name
+                            (codex-ide-org--expanded-file default-directory)))))
+    (when (and buffer-file-name
+               (codex-ide-org--same-file-p buffer-file-name task-file))
+      (setq-local codex-ide-org--buffer-task-file (expand-file-name task-file))
+      (codex-ide-org--configure-workflow)
+      (add-hook 'after-save-hook #'codex-ide-org--after-save nil t))))
 
 (defun codex-ide-org--after-save ()
-  "Rebuild the index after saving the configured Org file."
-  (when (and buffer-file-name
-             (codex-ide-org--same-file-p buffer-file-name codex-ide-org-file))
-    (codex-ide-org-rebuild-index)))
+  "Rebuild the index after saving the current resolved Org task file."
+  (when (and buffer-file-name codex-ide-org--buffer-task-file
+             (codex-ide-org--same-file-p buffer-file-name
+                                         codex-ide-org--buffer-task-file))
+    (codex-ide-org--rebuild-file codex-ide-org--buffer-task-file)))
 
-;;;###autoload
-(defun codex-ide-org-rebuild-index ()
-  "Rebuild the Codex thread-to-Org-heading index.
-
-Only non-empty `CODEX_THREAD_ID' values are indexed.  Multiple headings with
-the same value are retained so callers can report a duplicate conflict.  The
-configured file is not created when it does not exist."
-  (interactive)
+(defun codex-ide-org--rebuild-file (file)
+  "Rebuild the Codex thread index from expanded FILE."
   (codex-ide-org--clear-index)
-  (setq codex-ide-org--indexed-file (codex-ide-org--expanded-file))
+  (setq codex-ide-org--indexed-file (expand-file-name file))
   (when (file-readable-p codex-ide-org--indexed-file)
     (let ((buffer (find-file-noselect codex-ide-org--indexed-file)))
       (with-current-buffer buffer
         (unless (derived-mode-p 'org-mode)
           (org-mode))
-        (codex-ide-org--install-save-hook)
+        (codex-ide-org--install-save-hook codex-ide-org--indexed-file)
         (org-with-wide-buffer
          (org-map-entries
           (lambda ()
@@ -168,20 +224,30 @@ configured file is not created when it does not exist."
   (run-hooks 'codex-ide-org-index-updated-hook)
   codex-ide-org--index)
 
-(defun codex-ide-org--ensure-current-index ()
-  "Rebuild when the configured file differs from the indexed file."
-  (unless (codex-ide-org--same-file-p codex-ide-org--indexed-file
-                                     codex-ide-org-file)
-    (codex-ide-org-rebuild-index)))
+;;;###autoload
+(defun codex-ide-org-rebuild-index (&optional directory)
+  "Rebuild the Codex thread-to-Org-heading index.
 
-(defun codex-ide-org-index-markers (thread-id)
+Only non-empty `CODEX_THREAD_ID' values are indexed.  Multiple headings with
+the same value are retained so callers can report a duplicate conflict.  The
+configured file is not created when it does not exist."
+  (interactive)
+  (codex-ide-org--rebuild-file (codex-ide-org--expanded-file directory)))
+
+(defun codex-ide-org--ensure-current-index (&optional directory)
+  "Rebuild when the configured file differs from the indexed file."
+  (let ((file (codex-ide-org--expanded-file directory)))
+    (unless (codex-ide-org--same-file-p codex-ide-org--indexed-file file)
+      (codex-ide-org--rebuild-file file))))
+
+(defun codex-ide-org-index-markers (thread-id &optional directory)
   "Return live Org markers associated with THREAD-ID."
-  (codex-ide-org--ensure-current-index)
+  (codex-ide-org--ensure-current-index directory)
   (seq-filter (lambda (marker)
                 (and (markerp marker) (marker-buffer marker)))
               (copy-sequence (gethash thread-id codex-ide-org--index))))
 
-(defun codex-ide-org-thread-state (thread-id)
+(defun codex-ide-org-thread-state (thread-id &optional directory)
   "Return the Org link state plist for THREAD-ID.
 
 The `:status' value is `missing', `linked', or `duplicate'.  `:markers'
@@ -189,7 +255,7 @@ contains every live matching heading marker.  For a unique link, `:marker'
 contains that marker as a convenience."
   (unless (and (stringp thread-id) (not (string-empty-p (string-trim thread-id))))
     (user-error "A non-empty Codex thread ID is required"))
-  (let ((markers (codex-ide-org-index-markers (string-trim thread-id))))
+  (let ((markers (codex-ide-org-index-markers (string-trim thread-id) directory)))
     (cond
      ((null markers)
       (list :thread-id thread-id :status 'missing :markers nil :marker nil))
@@ -200,9 +266,9 @@ contains that marker as a convenience."
       (list :thread-id thread-id :status 'duplicate
             :markers markers :marker nil)))))
 
-(defun codex-ide-org-require-thread-marker (thread-id)
+(defun codex-ide-org-require-thread-marker (thread-id &optional directory)
   "Return the unique Org marker for THREAD-ID or signal a link error."
-  (let ((state (codex-ide-org-thread-state thread-id)))
+  (let ((state (codex-ide-org-thread-state thread-id directory)))
     (pcase (plist-get state :status)
       ('linked (plist-get state :marker))
       ('missing (signal 'codex-ide-org-missing-link (list thread-id)))
@@ -236,7 +302,10 @@ contains that marker as a convenience."
   (unless (derived-mode-p 'org-mode)
     (user-error "This command must be used from an Org heading"))
   (unless (and buffer-file-name
-               (codex-ide-org--same-file-p buffer-file-name codex-ide-org-file))
+               (codex-ide-org--same-file-p
+                buffer-file-name
+                (or codex-ide-org--buffer-task-file
+                    (codex-ide-org--expanded-file default-directory))))
     (user-error "This heading is not in the configured Codex task file: %s"
                 (codex-ide-org--expanded-file)))
   (org-back-to-heading t)
@@ -261,19 +330,22 @@ contains that marker as a convenience."
           (or (plist-get row :directory) "no working directory")
           (plist-get row :thread-id)))
 
-(defun codex-ide-org--global-thread-rows ()
-  "Return global normalized rows that have a usable thread ID."
+(defun codex-ide-org--thread-rows ()
+  "Return normalized rows in the configured interactive scope."
   (seq-filter
    (lambda (row)
      (let ((thread-id (plist-get row :thread-id)))
        (and (stringp thread-id) (not (string-empty-p thread-id)))))
-   (codex-ide-list-thread-rows :global t)))
+   (if (eq codex-ide-org-thread-list-scope 'global)
+       (codex-ide-list-thread-rows :global t)
+     (codex-ide-list-thread-rows
+      :directory (codex-ide-org--context-directory)))))
 
 (defun codex-ide-org--read-thread-row (prompt &optional predicate)
-  "Read a global thread row using PROMPT, optionally limited by PREDICATE."
+  "Read a scoped thread row using PROMPT, optionally limited by PREDICATE."
   (let* ((rows (if predicate
-                   (seq-filter predicate (codex-ide-org--global-thread-rows))
-                 (codex-ide-org--global-thread-rows)))
+                   (seq-filter predicate (codex-ide-org--thread-rows))
+                 (codex-ide-org--thread-rows)))
          (choices (mapcar (lambda (row)
                             (cons (codex-ide-org--row-label row) row))
                           rows)))
@@ -317,7 +389,7 @@ infer links from titles or directories."
 
 ;;;###autoload
 (defun codex-ide-org-link-current-heading ()
-  "Choose a global Codex thread and link it to the current Org heading."
+  "Choose a scoped Codex thread and link it to the current Org heading."
   (interactive)
   (codex-ide-org--require-task-heading)
   (let* ((row (codex-ide-org--read-thread-row "Link Codex thread: "))
@@ -352,11 +424,12 @@ infer links from titles or directories."
   "Open the Codex thread linked to the current Org heading."
   (interactive)
   (codex-ide-org--require-task-heading)
-  (let ((thread-id (org-entry-get nil codex-ide-org-thread-id-property nil)))
+  (let ((thread-id (org-entry-get nil codex-ide-org-thread-id-property nil))
+        (directory (org-entry-get nil codex-ide-org-directory-property nil)))
     (unless thread-id
       (user-error "This Org task is not linked to a Codex thread"))
     ;; Resolve the current directory from Codex.  CODEX_CWD is only a snapshot.
-    (codex-ide-open-thread thread-id)))
+    (codex-ide-open-thread thread-id directory)))
 
 (defun codex-ide-org--marker-label (marker)
   "Return a completion label for an Org heading at MARKER."
@@ -396,15 +469,16 @@ infer links from titles or directories."
   marker)
 
 ;;;###autoload
-(defun codex-ide-org-goto-thread-task (thread-id)
+(defun codex-ide-org-goto-thread-task (thread-id &optional directory)
   "Jump to the Org task linked to Codex THREAD-ID.
 
-Interactively, choose THREAD-ID from the global Codex inventory."
+Interactively, choose THREAD-ID from the configured Codex inventory scope."
   (interactive
-   (list (plist-get (codex-ide-org--read-thread-row "Go to Org task for: ")
-                    :thread-id)))
+   (let ((row (codex-ide-org--read-thread-row "Go to Org task for: ")))
+     (list (plist-get row :thread-id) (plist-get row :directory))))
   (codex-ide-org--display-marker
-   (codex-ide-org-resolve-thread-marker thread-id)))
+   (let ((default-directory (or directory default-directory)))
+     (codex-ide-org-resolve-thread-marker thread-id))))
 
 (defun codex-ide-org--task-title (title)
   "Return TITLE normalized for a single Org heading line."
@@ -416,19 +490,20 @@ Interactively, choose THREAD-ID from the global Codex inventory."
 
 This is the only work-package-5 operation that may create
 `codex-ide-org-file' and its parent directory."
-  (let ((thread-id (plist-get row :thread-id))
-        (directory (plist-get row :directory)))
+  (let* ((thread-id (plist-get row :thread-id))
+         (directory (plist-get row :directory))
+         (file (codex-ide-org--expanded-file directory)))
     (unless (and (stringp thread-id) (not (string-empty-p thread-id)))
       (user-error "The Codex row has no usable thread ID"))
-    (pcase (plist-get (codex-ide-org-thread-state thread-id) :status)
+    (pcase (plist-get (codex-ide-org-thread-state thread-id directory) :status)
       ('linked (user-error "Codex thread %s already has an Org task" thread-id))
       ('duplicate (user-error "Codex thread %s has multiple Org tasks" thread-id)))
-    (make-directory (file-name-directory (codex-ide-org--expanded-file)) t)
-    (let ((buffer (find-file-noselect (codex-ide-org--expanded-file))))
+    (make-directory (file-name-directory file) t)
+    (let ((buffer (find-file-noselect file)))
       (with-current-buffer buffer
         (unless (derived-mode-p 'org-mode)
           (org-mode))
-        (codex-ide-org--install-save-hook)
+        (codex-ide-org--install-save-hook file)
         (goto-char (point-max))
         (unless (or (= (point-min) (point-max)) (bolp))
           (insert "\n"))
@@ -441,11 +516,11 @@ This is the only work-package-5 operation that may create
         ;; link-change preference.
         (save-buffer)
         (codex-ide-org--notify-changed)
-        (codex-ide-org-require-thread-marker thread-id)))))
+        (codex-ide-org-require-thread-marker thread-id directory)))))
 
 ;;;###autoload
 (defun codex-ide-org-create-thread-task ()
-  "Choose an unlinked global Codex thread and create its Org task explicitly."
+  "Choose a scoped unlinked Codex thread and create its Org task explicitly."
   (interactive)
   (let* ((row (codex-ide-org--read-thread-row
                "Create Org task for: "
@@ -472,7 +547,7 @@ This is the only work-package-5 operation that may create
 (defun codex-ide-org--row-link-state (row)
   "Return the Org link state for normalized Codex ROW, or nil."
   (when-let* ((thread-id (codex-ide-org--row-thread-id row)))
-    (codex-ide-org-thread-state thread-id)))
+    (codex-ide-org-thread-state thread-id (plist-get row :directory))))
 
 (defun codex-ide-org--workflow-face (state)
   "Return an Org face suitable for workflow STATE."
@@ -480,7 +555,9 @@ This is the only work-package-5 operation that may create
 
 (defun codex-ide-org-status-annotation (row)
   "Return a clearly labelled Org workflow annotation for Codex ROW."
-  (when-let* ((link-state (codex-ide-org--row-link-state row)))
+  (when (or codex-ide-org-annotate-global-status
+            (not (bound-and-true-p codex-ide-status-mode--global-p)))
+    (when-let* ((link-state (codex-ide-org--row-link-state row)))
     (pcase (plist-get link-state :status)
       ('missing
        (concat "Workflow: " (propertize "UNLINKED" 'face 'shadow)))
@@ -493,7 +570,7 @@ This is the only work-package-5 operation that may create
                   "NONE")))
          (concat "Workflow: "
                  (propertize workflow
-                             'face (codex-ide-org--workflow-face workflow))))))))
+                             'face (codex-ide-org--workflow-face workflow)))))))))
 
 (defun codex-ide-org--row-missing-p (row)
   "Return non-nil when Codex ROW has no linked Org task."
@@ -506,7 +583,8 @@ This is the only work-package-5 operation that may create
 
 (defun codex-ide-org--status-goto-task (row)
   "Status action that jumps from Codex ROW to its Org task."
-  (codex-ide-org-goto-thread-task (codex-ide-org--row-thread-id row)))
+  (codex-ide-org-goto-thread-task (codex-ide-org--row-thread-id row)
+                                  (plist-get row :directory)))
 
 (defun codex-ide-org--status-create-task (row)
   "Explicitly create and display a task for Codex ROW as a status action."
