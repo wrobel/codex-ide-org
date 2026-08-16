@@ -86,6 +86,38 @@
       (should (eq (plist-get (codex-ide-org-thread-state "added") :status)
                   'linked)))))
 
+(ert-deftest codex-ide-org-lazy-project-index-switch-does-not-notify-status ()
+  (let* ((temporary-directory (make-temp-file "codex-ide-org-switch-" t))
+         (project-one (expand-file-name "one" temporary-directory))
+         (project-two (expand-file-name "two" temporary-directory))
+         (codex-ide-org-file-function
+          (lambda (directory) (expand-file-name "tasks.org" directory)))
+         (notifications 0)
+         (codex-ide-org-index-updated-hook
+          (list (lambda () (setq notifications (1+ notifications))))))
+    (unwind-protect
+        (progn
+          (make-directory project-one t)
+          (make-directory project-two t)
+          (with-temp-file (expand-file-name "tasks.org" project-one)
+            (insert "* WIP One\n:PROPERTIES:\n:CODEX_THREAD_ID: one\n:END:\n"))
+          (with-temp-file (expand-file-name "tasks.org" project-two)
+            (insert "* TODO Two\n:PROPERTIES:\n:CODEX_THREAD_ID: two\n:END:\n"))
+          (codex-ide-org--ensure-current-index project-one)
+          (should (eq (plist-get (codex-ide-org-thread-state "one" project-one)
+                                 :status)
+                      'linked))
+          (codex-ide-org--ensure-current-index project-two)
+          (should (eq (plist-get (codex-ide-org-thread-state "two" project-two)
+                                 :status)
+                      'linked))
+          (should (= notifications 0)))
+      (dolist (file (list (expand-file-name "tasks.org" project-one)
+                          (expand-file-name "tasks.org" project-two)))
+        (when-let* ((buffer (get-file-buffer file)))
+          (kill-buffer buffer)))
+      (delete-directory temporary-directory t))))
+
 (ert-deftest codex-ide-org-package-load-does-not-create-configured-file ()
   (let* ((temporary-directory (make-temp-file "codex-ide-org-missing-" t))
          (codex-ide-org-file (expand-file-name "missing/tasks.org"

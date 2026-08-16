@@ -127,6 +127,11 @@ separate. Global status annotations are disabled by default because resolving
 them can read one task file per project; set
 `codex-ide-org-annotate-global-status` to non-nil to opt in.
 
+Project status buffers may coexist. Switching the package's lightweight index
+between their task files is a silent read operation and does not recursively
+refresh every other open status buffer; actual saves and explicit index
+rebuilds still notify status views.
+
 In Codex status buffers, `A` is the base package's standalone archive toggle.
 Use `M-x codex-ide-status-archived` to find project-local archived sessions and
 unarchive them. These operations deliberately do not derive or update Org TODO

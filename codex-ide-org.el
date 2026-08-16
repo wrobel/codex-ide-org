@@ -211,8 +211,13 @@ those expressions keeps the resulting workflow local to the configured file."
                                          codex-ide-org--buffer-task-file))
     (codex-ide-org--rebuild-file codex-ide-org--buffer-task-file)))
 
-(defun codex-ide-org--rebuild-file (file)
-  "Rebuild the Codex thread index from expanded FILE."
+(defun codex-ide-org--rebuild-file (file &optional silent)
+  "Rebuild the Codex thread index from expanded FILE.
+
+When SILENT is non-nil, do not run `codex-ide-org-index-updated-hook'.  Silent
+rebuilds are used when a read switches the single-project index; they do not
+represent an external data change and must not recursively refresh every open
+Codex status buffer."
   (codex-ide-org--clear-index)
   (setq codex-ide-org--indexed-file (expand-file-name file))
   (when (file-readable-p codex-ide-org--indexed-file)
@@ -237,7 +242,8 @@ those expressions keeps the resulting workflow local to the configured file."
           nil
           'file)))))
   (setq codex-ide-org-index-generation (1+ codex-ide-org-index-generation))
-  (run-hooks 'codex-ide-org-index-updated-hook)
+  (unless silent
+    (run-hooks 'codex-ide-org-index-updated-hook))
   codex-ide-org--index)
 
 ;;;###autoload
@@ -259,7 +265,7 @@ longer usable even when the resolved file name itself did not change."
     (unless (and (codex-ide-org--same-file-p codex-ide-org--indexed-file file)
                  (or (not (file-readable-p file))
                      (get-file-buffer file)))
-      (codex-ide-org--rebuild-file file))))
+      (codex-ide-org--rebuild-file file t))))
 
 (defun codex-ide-org-index-markers (thread-id &optional directory)
   "Return live Org markers associated with THREAD-ID."
@@ -550,7 +556,7 @@ This is the only work-package-5 operation that may create
     ;; Creation is the only operation that can introduce a duplicate.  Read the
     ;; target file afresh so even stale or externally invalidated markers can
     ;; never make an existing link appear absent.
-    (codex-ide-org--rebuild-file file)
+    (codex-ide-org--rebuild-file file t)
     (pcase (plist-get (codex-ide-org-thread-state thread-id directory) :status)
       ('linked (user-error "Codex thread %s already has an Org task" thread-id))
       ('duplicate (user-error "Codex thread %s has multiple Org tasks" thread-id)))
