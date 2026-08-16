@@ -82,6 +82,10 @@ Other Org files and global TODO settings are not modified.
 - `M-x codex-ide-org-unlink-current-heading` removes both link properties after
   confirmation.
 - `M-x codex-ide-org-open-thread-at-point` opens the linked Codex thread.
+- `M-x codex-ide-org-archive-thread-at-point` archives the linked Codex thread
+  without changing its Org workflow state.
+- `M-x codex-ide-org-unarchive-thread-at-point` restores the linked Codex
+  thread, again without changing Org workflow.
 - `M-x codex-ide-org-goto-thread-task` chooses a project thread and jumps to its
   linked task.
 - `M-x codex-ide-org-create-thread-task` explicitly creates a new task for an
@@ -101,9 +105,10 @@ Work package 6 adds an optional status-view adapter. Register it explicitly:
 (codex-ide-org-register-status-integration)
 ```
 
-Every row in `M-x codex-ide-status` then shows a separate `Workflow:`
-annotation: its Org state, `UNLINKED`, or `DUPLICATE`. The existing technical
-state remains unchanged. On a session row, press `a` to choose an available
+Every row in `M-x codex-ide-status` then shows its compact Org state,
+`UNLINKED`, or `DUPLICATE` before the Codex title. The existing technical state
+remains unchanged. Other Org-backed metadata can independently use the generic
+before- or after-title hooks. On a session row, press `a` to choose an available
 Org action:
 
 - go to the linked task;
@@ -121,6 +126,11 @@ changes an Org workflow keyword. Profile-level activation is intentionally
 separate. Global status annotations are disabled by default because resolving
 them can read one task file per project; set
 `codex-ide-org-annotate-global-status` to non-nil to opt in.
+
+In Codex status buffers, `A` is the base package's standalone archive toggle.
+Use `M-x codex-ide-status-archived` to find project-local archived sessions and
+unarchive them. These operations deliberately do not derive or update Org TODO
+keywords.
 
 ## Development
 

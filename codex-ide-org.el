@@ -452,6 +452,37 @@ infer links from titles or directories."
     ;; Resolve the current directory from Codex.  CODEX_CWD is only a snapshot.
     (codex-ide-open-thread thread-id directory)))
 
+(defun codex-ide-org--linked-thread-at-point ()
+  "Return the linked Codex thread ID and directory at the current Org heading."
+  (codex-ide-org--require-task-heading)
+  (let ((thread-id (org-entry-get nil codex-ide-org-thread-id-property nil))
+        (directory (org-entry-get nil codex-ide-org-directory-property nil)))
+    (unless thread-id
+      (user-error "This Org task is not linked to a Codex thread"))
+    (list thread-id directory)))
+
+;;;###autoload
+(defun codex-ide-org-archive-thread-at-point ()
+  "Archive the Codex thread linked to the current Org heading.
+
+This does not change the Org workflow state."
+  (interactive)
+  (pcase-let ((`(,thread-id ,directory) (codex-ide-org--linked-thread-at-point)))
+    (when (y-or-n-p (format "Archive linked Codex thread %s? " thread-id))
+      (codex-ide-archive-thread thread-id :directory directory)
+      (message "Archived Codex thread %s; Org workflow unchanged" thread-id))))
+
+;;;###autoload
+(defun codex-ide-org-unarchive-thread-at-point ()
+  "Unarchive the Codex thread linked to the current Org heading.
+
+This does not change the Org workflow state."
+  (interactive)
+  (pcase-let ((`(,thread-id ,directory) (codex-ide-org--linked-thread-at-point)))
+    (when (y-or-n-p (format "Unarchive linked Codex thread %s? " thread-id))
+      (codex-ide-unarchive-thread thread-id :directory directory)
+      (message "Unarchived Codex thread %s; Org workflow unchanged" thread-id))))
+
 (defun codex-ide-org--marker-label (marker)
   "Return a completion label for an Org heading at MARKER."
   (org-with-point-at marker
@@ -579,23 +610,22 @@ This is the only work-package-5 operation that may create
   (if (member state '("DONE" "CANCELLED")) 'org-done 'org-todo))
 
 (defun codex-ide-org-status-annotation (row)
-  "Return a clearly labelled Org workflow annotation for Codex ROW."
+  "Return a compact Org workflow annotation for Codex ROW."
   (when (or codex-ide-org-annotate-global-status
             (not (bound-and-true-p codex-ide-status-mode--global-p)))
     (when-let* ((link-state (codex-ide-org--row-link-state row)))
     (pcase (plist-get link-state :status)
       ('missing
-       (concat "Workflow: " (propertize "UNLINKED" 'face 'shadow)))
+       (propertize "UNLINKED" 'face 'shadow))
       ('duplicate
-       (concat "Workflow: " (propertize "DUPLICATE" 'face 'error)))
+       (propertize "DUPLICATE" 'face 'error))
       ('linked
        (let ((workflow
               (or (codex-ide-org-marker-workflow-state
                    (plist-get link-state :marker))
                   "NONE")))
-         (concat "Workflow: "
-                 (propertize workflow
-                             'face (codex-ide-org--workflow-face workflow)))))))))
+         (propertize workflow
+                     'face (codex-ide-org--workflow-face workflow))))))))
 
 (defun codex-ide-org--row-missing-p (row)
   "Return non-nil when Codex ROW has no linked Org task."
@@ -661,7 +691,7 @@ This is the only work-package-5 operation that may create
   "Register Org workflow annotations and actions in Codex status views."
   (interactive)
   (unless codex-ide-org-status-integration-enabled-p
-    (add-hook 'codex-ide-status-annotation-functions
+    (add-hook 'codex-ide-status-before-title-functions
               #'codex-ide-org-status-annotation)
     ;; Registration prepends entries, so register in reverse display order.
     (codex-ide-register-status-action
@@ -686,7 +716,7 @@ This is the only work-package-5 operation that may create
 (defun codex-ide-org-unregister-status-integration ()
   "Remove this package's annotations and actions from Codex status views."
   (interactive)
-  (remove-hook 'codex-ide-status-annotation-functions
+  (remove-hook 'codex-ide-status-before-title-functions
                #'codex-ide-org-status-annotation)
   (dolist (name codex-ide-org--status-action-names)
     (codex-ide-unregister-status-action name))

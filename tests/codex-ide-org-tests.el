@@ -169,6 +169,26 @@
           (codex-ide-org-open-thread-at-point))
         (should (equal opened '("open-me" "/stale/snapshot")))))))
 
+(ert-deftest codex-ide-org-archive-commands-use-linked-id-without-changing-workflow ()
+  (codex-ide-org-test-with-file
+      "* HOLD Parked task\n:PROPERTIES:\n:CODEX_THREAD_ID: parked-thread\n:CODEX_CWD: /tmp/parked\n:END:\n"
+    (with-current-buffer (get-file-buffer codex-ide-org-file)
+      (goto-char (point-min))
+      (let (calls)
+        (cl-letf (((symbol-function 'y-or-n-p) (lambda (&rest _args) t))
+                  ((symbol-function 'codex-ide-archive-thread)
+                   (lambda (thread-id &rest args)
+                     (push (list 'archive thread-id args) calls)))
+                  ((symbol-function 'codex-ide-unarchive-thread)
+                   (lambda (thread-id &rest args)
+                     (push (list 'unarchive thread-id args) calls))))
+          (codex-ide-org-archive-thread-at-point)
+          (codex-ide-org-unarchive-thread-at-point))
+        (should (equal (nreverse calls)
+                       '((archive "parked-thread" (:directory "/tmp/parked"))
+                         (unarchive "parked-thread" (:directory "/tmp/parked")))))
+        (should (equal (org-get-todo-state) "HOLD"))))))
+
 (ert-deftest codex-ide-org-resolve-thread-marker-asks-on-duplicate ()
   (codex-ide-org-test-with-file
       "* TODO First\n:PROPERTIES:\n:CODEX_THREAD_ID: duplicate-choice\n:END:\n* HOLD Second\n:PROPERTIES:\n:CODEX_THREAD_ID: duplicate-choice\n:END:\n"
@@ -315,7 +335,7 @@
                  (codex-ide-org-create-task-for-row row "Fresh task")))
           (should (equal (substring-no-properties
                           (codex-ide-org-status-annotation row))
-                         "Workflow: TODO")))
+                         "TODO")))
       (when (buffer-live-p buffer) (kill-buffer buffer))
       (delete-directory temporary-directory t))))
 
@@ -333,7 +353,7 @@
           (should-not (marker-buffer marker))
           (should (equal (substring-no-properties
                           (codex-ide-org-status-annotation row))
-                         "Workflow: TODO"))
+                         "TODO"))
           (should (codex-ide-org--row-navigable-p row))
           (should-not (codex-ide-org--row-missing-p row)))
       (when-let* ((task-buffer
@@ -366,19 +386,19 @@
       "* REVIEW Review linked\n:PROPERTIES:\n:CODEX_THREAD_ID: linked-row\n:END:\n* TODO First duplicate\n:PROPERTIES:\n:CODEX_THREAD_ID: duplicate-row\n:END:\n* HOLD Second duplicate\n:PROPERTIES:\n:CODEX_THREAD_ID: duplicate-row\n:END:\n"
     (should (equal (codex-ide-org-status-annotation
                     '(:thread-id "linked-row" :technical-status "running"))
-                   "Workflow: REVIEW"))
+                   "REVIEW"))
     (should (equal (codex-ide-org-status-annotation
                     '(:thread-id "linked-row" :technical-status "stored"))
-                   "Workflow: REVIEW"))
+                   "REVIEW"))
     (should (equal (codex-ide-org-status-annotation
                     '(:thread-id "missing-row" :technical-status "running"))
-                   "Workflow: UNLINKED"))
+                   "UNLINKED"))
     (should (equal (codex-ide-org-status-annotation
                     '(:thread-id "duplicate-row" :technical-status "idle"))
-                   "Workflow: DUPLICATE"))))
+                   "DUPLICATE"))))
 
 (ert-deftest codex-ide-org-status-integration-registers-context-actions ()
-  (let ((codex-ide-status-annotation-functions nil)
+  (let ((codex-ide-status-before-title-functions nil)
         (codex-ide-status-actions nil)
         (codex-ide-org-index-updated-hook nil)
         (codex-ide-org-status-integration-enabled-p nil))
@@ -389,11 +409,11 @@
                  (list :status (plist-get row :org-status)))))
       (should (codex-ide-org-register-status-integration))
       (should (memq #'codex-ide-org-status-annotation
-                    codex-ide-status-annotation-functions))
+                    codex-ide-status-before-title-functions))
       (should (memq #'codex-ide-org--status-index-updated
                     codex-ide-org-index-updated-hook))
       (should (codex-ide-org-register-status-integration))
-      (should (= (length codex-ide-status-annotation-functions) 1))
+      (should (= (length codex-ide-status-before-title-functions) 1))
       (should (= (length codex-ide-status-actions) 3))
       (should (equal
                (mapcar (lambda (action) (plist-get action :name))
@@ -411,7 +431,7 @@
                         '(:thread-id "duplicate" :org-status duplicate)))
                '("Org: Go to task" "Org: Set workflow state")))
       (should-not (codex-ide-org-unregister-status-integration))
-      (should-not codex-ide-status-annotation-functions)
+      (should-not codex-ide-status-before-title-functions)
       (should-not codex-ide-status-actions)
       (should-not codex-ide-org-index-updated-hook))))
 
