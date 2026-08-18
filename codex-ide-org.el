@@ -4,7 +4,7 @@
 
 ;; Author: Gunnar Wrobel
 ;; URL: https://github.com/wrobel/codex-ide-org
-;; Version: 0.4.1
+;; Version: 0.5.0
 ;; Package-Requires: ((emacs "28.1") (org "9.5") (codex-ide "0.3.2"))
 ;; Keywords: codex, ai, agents, outlines
 
@@ -23,6 +23,7 @@
 (require 'codex-ide-status-api)
 
 (defvar codex-ide-status-mode--global-p)
+(defvar codex-ide-status-mode-hook)
 
 (defgroup codex-ide-org nil
   "Org workflow data for Codex IDE threads."
@@ -125,6 +126,21 @@ always annotated when the status integration is registered."
               "|" "DONE(d)" "CANCELLED(c)"))
   "Buffer-local workflow sequence for `codex-ide-org-file'."
   :type 'sexp
+  :group 'codex-ide-org)
+
+(defcustom codex-ide-org-status-workflow-keys
+  '((?p . "PLAN")
+    (?t . "TODO")
+    (?w . "WIP")
+    (?r . "REVIEW")
+    (?h . "HOLD")
+    (?d . "DONE")
+    (?c . "CANCELLED"))
+  "Single-key workflow choices offered after `C-t' in status views.
+
+Keys are matched case-insensitively.  Every configured state must also occur
+in `codex-ide-org-todo-keywords' for the selected project task file."
+  :type '(alist :key-type character :value-type string)
   :group 'codex-ide-org)
 
 (defcustom codex-ide-org-save-after-change t
@@ -687,6 +703,80 @@ This is the only work-package-5 operation that may create
                                     nil nil current)))
     (codex-ide-org--set-marker-workflow marker workflow)))
 
+(defun codex-ide-org-classify-status-row (row workflow)
+  "Classify Codex status ROW with Org WORKFLOW without leaving its list.
+
+Create and link an Org task when ROW is currently unlinked.  Existing links
+are reused; duplicate links retain the normal explicit marker selection."
+  (let* ((thread-id (codex-ide-org--row-thread-id row))
+         (directory (plist-get row :directory)))
+    (unless thread-id
+      (user-error "The Codex row has no usable thread ID"))
+    (let* ((state (codex-ide-org--row-link-state row))
+           (marker
+            (pcase (plist-get state :status)
+              ('missing
+               (codex-ide-org-create-task-for-row
+                row (or (plist-get row :title) "Untitled Codex task")))
+              ('linked (plist-get state :marker))
+              ('duplicate
+               (let ((default-directory (or directory default-directory)))
+                 (codex-ide-org-resolve-thread-marker thread-id)))
+              (_ (user-error "Cannot resolve an Org task for Codex thread %s"
+                             thread-id)))))
+      (prog1 (codex-ide-org--set-marker-workflow marker workflow)
+        (message "Codex thread %s classified as %s" thread-id workflow)))))
+
+(defun codex-ide-org--status-workflow-prompt ()
+  "Return a compact prompt for `codex-ide-org-status-workflow-keys'."
+  (format "Classify Org task [%s]: "
+          (mapconcat (lambda (entry)
+                       (format "%c %s" (car entry) (cdr entry)))
+                     codex-ide-org-status-workflow-keys ", ")))
+
+;;;###autoload
+(defun codex-ide-org-status-classify ()
+  "Classify the Codex status row at point using a second workflow key.
+
+The default sequence is `C-t' followed by `p', `t', `w', `r', `h', `d', or
+`c'.  An unlinked row is first created in its project Org task file.  The
+status buffer remains selected for fast repeated classification."
+  (interactive)
+  (unless (fboundp 'codex-ide-status-row-at-point)
+    (user-error "Codex IDE status mode is not available"))
+  (let* ((event (read-key (codex-ide-org--status-workflow-prompt)))
+         (key (and (characterp event) (downcase event)))
+         (workflow (alist-get key codex-ide-org-status-workflow-keys)))
+    (unless workflow
+      (user-error "No Codex Org workflow is assigned to %s"
+                  (key-description (vector event))))
+    (codex-ide-org-classify-status-row
+     (codex-ide-status-row-at-point) workflow)))
+
+(defvar codex-ide-org-status-keys-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-t") #'codex-ide-org-status-classify)
+    map)
+  "Keymap for `codex-ide-org-status-keys-mode'.")
+
+(define-minor-mode codex-ide-org-status-keys-mode
+  "Provide Org workflow keys in a Codex IDE status buffer."
+  :init-value nil
+  :lighter nil
+  :keymap codex-ide-org-status-keys-mode-map)
+
+(defun codex-ide-org--configure-status-keys-buffer ()
+  "Enable or disable Org status keys in the current Codex status buffer."
+  (codex-ide-org-status-keys-mode
+   (if codex-ide-org-status-integration-enabled-p 1 -1)))
+
+(defun codex-ide-org--configure-open-status-buffers ()
+  "Apply the current Org integration state to open Codex status buffers."
+  (dolist (buffer (buffer-list))
+    (with-current-buffer buffer
+      (when (eq major-mode 'codex-ide-status-mode)
+        (codex-ide-org--configure-status-keys-buffer)))))
+
 (defun codex-ide-org--status-index-updated ()
   "Refresh Codex status buffers after an external Org index update."
   (when codex-ide-org-status-integration-enabled-p
@@ -715,6 +805,9 @@ This is the only work-package-5 operation that may create
     (add-hook 'codex-ide-org-index-updated-hook
               #'codex-ide-org--status-index-updated)
     (setq codex-ide-org-status-integration-enabled-p t)
+    (add-hook 'codex-ide-status-mode-hook
+              #'codex-ide-org--configure-status-keys-buffer)
+    (codex-ide-org--configure-open-status-buffers)
     (codex-ide-status-notify-annotations-changed))
   codex-ide-org-status-integration-enabled-p)
 
@@ -729,6 +822,9 @@ This is the only work-package-5 operation that may create
   (remove-hook 'codex-ide-org-index-updated-hook
                #'codex-ide-org--status-index-updated)
   (setq codex-ide-org-status-integration-enabled-p nil)
+  (remove-hook 'codex-ide-status-mode-hook
+               #'codex-ide-org--configure-status-keys-buffer)
+  (codex-ide-org--configure-open-status-buffers)
   (codex-ide-status-notify-annotations-changed)
   codex-ide-org-status-integration-enabled-p)
 

@@ -115,6 +115,17 @@ Org action:
 - set the Org workflow state explicitly;
 - create a task when the thread is unlinked.
 
+For repeated classification, stay in either the active or archived status
+list and press `C-t`, followed by one workflow key:
+
+- `p` PLAN, `t` TODO, `w` WIP, `r` REVIEW;
+- `h` HOLD, `d` DONE, `c` CANCELLED.
+
+For `UNLINKED` rows this creates and saves the project task first, then applies
+the selected workflow. Linked tasks are updated in place, and the status list
+remains selected. Customize `codex-ide-org-status-workflow-keys` to change the
+second-key assignments.
+
 Disable the adapter without changing any Org data:
 
 ```emacs-lisp

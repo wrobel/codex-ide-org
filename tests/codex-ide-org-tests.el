@@ -7,6 +7,7 @@
 (require 'codex-ide-org)
 
 (defvar codex-ide-status-mode--global-p)
+(defvar codex-ide-status-mode-hook)
 
 (defmacro codex-ide-org-test-with-file (contents &rest body)
   "Create a temporary Org file containing CONTENTS and evaluate BODY."
@@ -432,6 +433,7 @@
 (ert-deftest codex-ide-org-status-integration-registers-context-actions ()
   (let ((codex-ide-status-before-title-functions nil)
         (codex-ide-status-actions nil)
+        (codex-ide-status-mode-hook nil)
         (codex-ide-org-index-updated-hook nil)
         (codex-ide-org-status-integration-enabled-p nil))
     (cl-letf (((symbol-function 'codex-ide-status-notify-annotations-changed)
@@ -444,6 +446,8 @@
                     codex-ide-status-before-title-functions))
       (should (memq #'codex-ide-org--status-index-updated
                     codex-ide-org-index-updated-hook))
+      (should (memq #'codex-ide-org--configure-status-keys-buffer
+                    codex-ide-status-mode-hook))
       (should (codex-ide-org-register-status-integration))
       (should (= (length codex-ide-status-before-title-functions) 1))
       (should (= (length codex-ide-status-actions) 3))
@@ -465,6 +469,7 @@
       (should-not (codex-ide-org-unregister-status-integration))
       (should-not codex-ide-status-before-title-functions)
       (should-not codex-ide-status-actions)
+      (should-not codex-ide-status-mode-hook)
       (should-not codex-ide-org-index-updated-hook))))
 
 (ert-deftest codex-ide-org-set-thread-workflow-is-explicit-and-persistent ()
@@ -516,6 +521,68 @@
                       (codex-ide-org-thread-state "duplicate-state") :markers)))
         (should (equal (codex-ide-org-marker-workflow-state (cadr markers))
                        "DONE"))))))
+
+(ert-deftest codex-ide-org-status-classify-creates-and-classifies-archived-row ()
+  (codex-ide-org-test-with-file ""
+    (let ((row `(:thread-id "archived-unlinked"
+                 :title "Classify from archive"
+                 :directory ,temporary-directory
+                 :archived t)))
+      (codex-ide-org-classify-status-row row "REVIEW")
+      (let ((marker (codex-ide-org-require-thread-marker
+                     "archived-unlinked" temporary-directory)))
+        (should (equal (codex-ide-org-marker-workflow-state marker) "REVIEW"))
+        (should (equal (org-with-point-at marker
+                         (org-get-heading t t t t))
+                       "Classify from archive")))
+      (should (equal
+               (codex-ide-org-status-annotation row)
+               "REVIEW")))))
+
+(ert-deftest codex-ide-org-status-classify-reuses-linked-task ()
+  (codex-ide-org-test-with-file
+      "* TODO Existing task\n:PROPERTIES:\n:CODEX_THREAD_ID: linked-classification\n:END:\n"
+    (codex-ide-org-classify-status-row
+     '(:thread-id "linked-classification" :title "Ignored title") "HOLD")
+    (let ((state (codex-ide-org-thread-state "linked-classification")))
+      (should (eq (plist-get state :status) 'linked))
+      (should (= (length (plist-get state :markers)) 1))
+      (should (equal
+               (codex-ide-org-marker-workflow-state (plist-get state :marker))
+               "HOLD")))))
+
+(ert-deftest codex-ide-org-status-classify-reads-second-key-and-stays-put ()
+  (codex-ide-org-test-with-file
+      "* WIP Keyboard task\n:PROPERTIES:\n:CODEX_THREAD_ID: keyboard-classification\n:END:\n"
+    (with-temp-buffer
+      (let ((status-buffer (current-buffer)))
+        (cl-letf (((symbol-function 'read-key) (lambda (_prompt) ?r))
+                  ((symbol-function 'codex-ide-status-row-at-point)
+                   (lambda () '(:thread-id "keyboard-classification"))))
+          (codex-ide-org-status-classify))
+        (should (eq (current-buffer) status-buffer))))
+    (should (equal
+             (codex-ide-org-marker-workflow-state
+              (codex-ide-org-require-thread-marker "keyboard-classification"))
+             "REVIEW"))))
+
+(ert-deftest codex-ide-org-status-classify-rejects-unassigned-key ()
+  (codex-ide-org-test-with-file ""
+    (cl-letf (((symbol-function 'read-key) (lambda (_prompt) ?x))
+              ((symbol-function 'codex-ide-status-row-at-point)
+               (lambda () '(:thread-id "must-not-exist"))))
+      (should-error (codex-ide-org-status-classify) :type 'user-error))
+    (should (eq (plist-get (codex-ide-org-thread-state "must-not-exist")
+                           :status)
+                'missing))))
+
+(ert-deftest codex-ide-org-status-keys-mode-provides-classification-prefix ()
+  (with-temp-buffer
+    (codex-ide-org-status-keys-mode 1)
+    (should (eq (key-binding (kbd "C-t"))
+                #'codex-ide-org-status-classify))
+    (codex-ide-org-status-keys-mode -1)
+    (should-not codex-ide-org-status-keys-mode)))
 
 (ert-deftest codex-ide-org-technical-events-do-not-change-workflow ()
   (codex-ide-org-test-with-file
